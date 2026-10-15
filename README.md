@@ -95,3 +95,7 @@ ExecStart=/usr/bin/ribbitd --length-scale 0.8 --sentence-silence 0.4
 ```
 ./ribbit-speak
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
