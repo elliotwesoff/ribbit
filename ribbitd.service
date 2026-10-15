@@ -1,0 +1,9 @@
+[Unit]
+Description=Ribbit text-to-speech daemon (Piper)
+
+[Service]
+ExecStart=/usr/bin/ribbitd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

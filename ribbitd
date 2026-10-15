@@ -1,0 +1,169 @@
+#!/usr/bin/python
+"""Keep a Piper voice loaded and speak text sent over a Unix socket.
+
+Protocol, one request per connection:
+
+  Speak: send a line with the length scale (e.g. "1.0", or empty for the
+  server's default), then the text, then close the write side. The server plays the audio and closes the
+  connection when it has finished. New speech interrupts any current
+  speech, and disconnecting before the end stops it.
+
+  Stop: send the line "stop". Whatever is being spoken stops.
+
+Test with:
+    printf '1.0\nHello there. This is a test.' | nc -NU "$XDG_RUNTIME_DIR/ribbit.sock"
+    printf 'stop\n' | nc -NU "$XDG_RUNTIME_DIR/ribbit.sock"
+"""
+
+import argparse
+import os
+import select
+import signal
+import socketserver
+import subprocess
+import sys
+import threading
+from typing import Optional
+
+from piper import PiperVoice, SynthesisConfig
+
+DEFAULT_MODEL = "/usr/share/piper-voices/en/en_US/ryan/high/en_US-ryan-high.onnx"
+DEFAULT_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "ribbit.sock")
+
+
+class Playback:
+    """One piece of speech playing through aplay, which can be stopped from any thread."""
+
+    def __init__(self, sample_rate: int) -> None:
+        self.stopped = threading.Event()
+        self.finished = threading.Event()
+        self.aplay = subprocess.Popen(
+            ["aplay", "-q", "-r", str(sample_rate), "-f", "S16_LE", "-c", "1", "-t", "raw", "-"],
+            stdin=subprocess.PIPE,
+        )
+
+    def write(self, audio: bytes) -> bool:
+        """Queue audio for playback. Returns False once playback has been stopped."""
+        if self.stopped.is_set():
+            return False
+        try:
+            self.aplay.stdin.write(audio)
+            return True
+        except (BrokenPipeError, ValueError):
+            return False
+
+    def wait(self) -> None:
+        """Wait for queued audio to finish playing, or for a stop."""
+        try:
+            self.aplay.stdin.close()
+        except BrokenPipeError:
+            pass
+        self.aplay.wait()
+        self.finished.set()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        self.aplay.kill()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-m", "--model", default=DEFAULT_MODEL)
+    parser.add_argument("--socket", default=DEFAULT_SOCKET)
+    parser.add_argument("--sentence-silence", type=float, default=0.2)
+    parser.add_argument(
+        "--length-scale",
+        type=float,
+        help="Default speed for requests that don't set one, lower is faster"
+        " (default: the voice's own, usually 1.0)",
+    )
+    args = parser.parse_args()
+
+    voice = PiperVoice.load(args.model)
+    default_length_scale = args.length_scale or voice.config.length_scale
+    silence = bytes(int(voice.config.sample_rate * args.sentence_silence) * 2)
+
+    # The first synthesis is slow while ONNX warms up, so do it now.
+    for _ in voice.synthesize("Warm up."):
+        pass
+
+    current: Optional[Playback] = None
+    current_lock = threading.Lock()
+
+    def stop_current() -> None:
+        with current_lock:
+            if current is not None:
+                current.stop()
+
+    def stop_on_hangup(sock, playback: Playback) -> None:
+        """Stop playback if the client disconnects before it finishes."""
+        poller = select.poll()
+        poller.register(sock, select.POLLHUP)
+        while not playback.finished.is_set():
+            if poller.poll(100):
+                playback.stop()
+                return
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            nonlocal current
+
+            first_line = self.rfile.readline().decode("utf-8", errors="replace").strip()
+            if first_line == "stop":
+                stop_current()
+                return
+
+            try:
+                length_scale = float(first_line)
+            except ValueError:
+                length_scale = default_length_scale
+            text = self.rfile.read().decode("utf-8", errors="replace")
+            text = " ".join(text.split())
+            if not text:
+                return
+
+            playback = Playback(voice.config.sample_rate)
+            with current_lock:
+                if current is not None:
+                    current.stop()
+                current = playback
+            threading.Thread(
+                target=stop_on_hangup, args=(self.connection, playback), daemon=True
+            ).start()
+
+            syn_config = SynthesisConfig(length_scale=length_scale)
+            for i, chunk in enumerate(voice.synthesize(text, syn_config)):
+                if i > 0 and not playback.write(silence):
+                    break
+                if not playback.write(chunk.audio_int16_bytes):
+                    break
+            playback.wait()
+
+            with current_lock:
+                if current is playback:
+                    current = None
+
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    if os.path.exists(args.socket):
+        os.remove(args.socket)
+
+    # Exit through the cleanup below on `kill` as well as Ctrl+C.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    with Server(args.socket, Handler) as server:
+        os.chmod(args.socket, 0o600)
+        print(f"Voice loaded, listening on {args.socket}", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_current()
+            if os.path.exists(args.socket):
+                os.remove(args.socket)
+
+
+if __name__ == "__main__":
+    main()

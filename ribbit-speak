@@ -1,0 +1,49 @@
+#!/bin/bash
+# Speak the X clipboard through ribbitd. If it's already speaking,
+# stop instead, so the same hotkey starts and stops speech.
+#
+# Usage: ribbit-speak [-p] [speed]
+#        ribbit-speak --stop
+#   -p      use the primary selection (highlighted text) instead of the clipboard
+#   speed   Piper length scale, lower is faster (default: ribbitd's --length-scale)
+#   --stop  stop whatever ribbitd is speaking, from any client
+
+socket=${RIBBIT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/ribbit.sock}
+pidfile=${XDG_RUNTIME_DIR:-/tmp}/ribbit-speak.pid
+
+if [ ! -S "$socket" ]; then
+    echo "ribbitd isn't running (no socket at $socket)" >&2
+    exit 1
+fi
+
+if [ "$1" = "--stop" ]; then
+    printf 'stop\n' | nc -NU "$socket"
+    exit 0
+fi
+
+selection=clipboard
+if [ "$1" = "-p" ]; then
+    selection=primary
+    shift
+fi
+speed=$1  # empty means ribbitd's default
+
+# The server stops speaking when our connection closes, so ending the
+# earlier run's nc is enough to stop it.
+if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    kill "$(cat "$pidfile")"
+    rm -f "$pidfile"
+    exit 0
+fi
+
+text=$(xclip -o -selection "$selection" 2>/dev/null)
+if [ -z "$text" ]; then
+    echo "The $selection selection is empty" >&2
+    exit 1
+fi
+
+# nc stays connected until the server finishes speaking.
+printf '%s\n%s' "$speed" "$text" | nc -NU "$socket" &
+echo $! > "$pidfile"
+wait $!
+rm -f "$pidfile"
